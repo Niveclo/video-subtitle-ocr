@@ -4,8 +4,11 @@ import re
 import sys
 from pathlib import Path
 
+import cv2
+import numpy as np
 import onnxruntime as ort
 from rapidocr import RapidOCR
+from rapidocr.ch_ppocr_det.utils import DetPreProcess
 from rapidocr.inference_engine.onnxruntime.main import OrtInferSession
 from rapidocr.inference_engine.onnxruntime.provider_config import ProviderConfig
 
@@ -26,6 +29,26 @@ def _session_options(config):
 def _providers(config):
     # RapidOCR 3.10.0 supplies an OmegaConf DictConfig for custom DML options.
     return [(name, dict(options)) for name, options in _ORIGINAL_PROVIDERS(config)]
+
+
+class _CompactDetPreProcess(DetPreProcess):
+    """Look up the original float32 normalization for every possible uint8 value."""
+
+    def __init__(self, *args):
+        super().__init__(*args)
+        # Use the original arithmetic, including nondefault channel mean/std values.
+        # Resizing returns uint8, so this table covers every possible model input pixel.
+        values = np.repeat(np.arange(256, dtype=np.uint8)[:, None, None], 3, axis=2)
+        self.lookup = super().normalize(values).astype(np.float32)
+
+    def __call__(self, image):
+        if image.dtype != np.uint8 or image.ndim != 3 or image.shape[2] != 3:
+            return super().__call__(image)
+        resized = self.resize(image)
+        if resized is None:
+            return None
+        pixels = cv2.LUT(resized, self.lookup)
+        return np.ascontiguousarray(pixels.transpose(2, 0, 1)[None])
 
 
 class OcrEngine:
@@ -71,7 +94,15 @@ class OcrEngine:
             }
         )
         # Force both sessions to initialize even for a video without any text.
-        engine._load_det_model()
+        detector = engine._load_det_model()
+        preprocess = _CompactDetPreProcess(
+            detector.limit_side_len, detector.limit_type, detector.mean, detector.std
+        )
+
+        def get_preprocess():
+            return preprocess
+
+        detector.get_preprocess = get_preprocess
         engine._load_rec_model()
         return engine
 
